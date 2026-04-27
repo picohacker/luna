@@ -1150,14 +1150,14 @@ struct ModulesSearchResultsSheet: View {
                 let subtitleArray: [String]? = subtitle.map { [$0] }
                 let pvc = PlayerViewController(
                     url: streamURL,
-                    preset: preset ?? PlayerPreset(id: .sdrRec709, title: "Default", summary: "", stream: nil, commands: []),
+                    preset: preset ?? PlayerPreset(title: "Default", summary: "", stream: nil, commands: []),
                     headers: finalHeaders,
                     subtitles: subtitleArray
                 )
                 if isMovie {
                     pvc.mediaInfo = .movie(id: tmdbId, title: mediaTitle)
                 } else if let episode = selectedEpisode {
-                    pvc.mediaInfo = .episode(showId: tmdbId, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber)
+                    pvc.mediaInfo = .episode(showId: tmdbId, showTitle: mediaTitle, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber)
                 }
                 pvc.modalPresentationStyle = .fullScreen
                 
@@ -1176,7 +1176,7 @@ struct ModulesSearchResultsSheet: View {
                 if isMovie {
                     playerVC.mediaInfo = .movie(id: tmdbId, title: mediaTitle)
                 } else if let episode = selectedEpisode {
-                    playerVC.mediaInfo = .episode(showId: tmdbId, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber)
+                    playerVC.mediaInfo = .episode(showId: tmdbId, showTitle: mediaTitle, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber)
                 }
                 playerVC.modalPresentationStyle = .fullScreen
                 

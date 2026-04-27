@@ -18,6 +18,12 @@ final class PlayerViewController: UIViewController {
         return v
     }()
     
+    private let primaryRenderView: MetalVideoView = {
+        let v = MetalVideoView()
+        v.translatesAutoresizingMaskIntoConstraints = false
+        return v
+    }()
+    
     private let displayLayer = AVSampleBufferDisplayLayer()
     
     private let centerPlayPauseButton: UIButton = {
@@ -177,6 +183,31 @@ final class PlayerViewController: UIViewController {
         return b
     }()
     
+    private let skipSegmentButton: UIButton = {
+        let b = UIButton(type: .system)
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.setTitle("Skip", for: .normal)
+        b.setTitleColor(.white, for: .normal)
+        b.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
+        b.backgroundColor = UIColor(white: 0.2, alpha: 0.55)
+        b.layer.cornerRadius = 18
+        b.layer.cornerCurve = .continuous
+#if os(tvOS)
+        if #available(tvOS 15.0, *) {
+            var config = UIButton.Configuration.plain()
+            config.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)
+            b.configuration = config
+        } else {
+            b.contentEdgeInsets = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+        }
+#else
+        b.contentEdgeInsets = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+#endif
+        b.alpha = 0.0
+        b.isHidden = true
+        return b
+    }()
+    
     private let progressContainer: UIView = {
         let v = UIView()
         v.translatesAutoresizingMaskIntoConstraints = false
@@ -189,11 +220,12 @@ final class PlayerViewController: UIViewController {
     class ProgressModel: ObservableObject {
         @Published var position: Double = 0
         @Published var duration: Double = 1
+        @Published var highlights: [ProgressHighlight] = []
     }
     private var progressModel = ProgressModel()
     
     private lazy var renderer: MPVSoftwareRenderer = {
-        let r = MPVSoftwareRenderer(displayLayer: displayLayer)
+        let r = MPVSoftwareRenderer(primaryRenderView: primaryRenderView, pipDisplayLayer: displayLayer)
         r.delegate = self
         return r
     }()
@@ -209,7 +241,7 @@ final class PlayerViewController: UIViewController {
     
     private var subtitleURLs: [String] = []
     private var currentSubtitleIndex: Int = 0
-    private var subtitleEntries: [SubtitleEntry] = []
+    private var pendingSubtitleURLs: [String]?
     
     class SubtitleModel: ObservableObject {
         @Published var currentAttributedText: NSAttributedString = NSAttributedString()
@@ -296,6 +328,8 @@ final class PlayerViewController: UIViewController {
     private var controlsHideWorkItem: DispatchWorkItem?
     private var controlsVisible: Bool = true
     private var pendingSeekTime: Double?
+    private var introDBSegments: [IntroDBSegment] = []
+    private var activeSkipSegmentID: String?
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -365,9 +399,13 @@ final class PlayerViewController: UIViewController {
         
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        displayLayer.frame = videoContainer.bounds
+        
+        primaryRenderView.frame = videoContainer.bounds
+        primaryRenderView.layoutIfNeeded()
+        
+        displayLayer.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
         displayLayer.isHidden = false
-        displayLayer.opacity = 1.0
+        displayLayer.opacity = 0.001
         
         if let gradientLayer = controlsOverlayView.layer.sublayers?.first(where: { $0.name == "gradientLayer" }) {
             gradientLayer.frame = controlsOverlayView.bounds
@@ -376,12 +414,39 @@ final class PlayerViewController: UIViewController {
         CATransaction.commit()
     }
     
+    override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        coordinator.animate(alongsideTransition: { [weak self] context in
+            guard let self else { return }
+            let previousTransform = self.primaryRenderView.transform
+            self.primaryRenderView.transform = previousTransform.scaledBy(x: 0.985, y: 0.985)
+            
+            UIView.animateKeyframes(
+                withDuration: context.transitionDuration,
+                delay: 0,
+                options: [.beginFromCurrentState, .calculationModeCubic, .allowUserInteraction]
+            ) {
+                UIView.addKeyframe(withRelativeStartTime: 0.0, relativeDuration: 0.75) {
+                    self.videoContainer.layoutIfNeeded()
+                    self.primaryRenderView.layoutIfNeeded()
+                }
+                
+                UIView.addKeyframe(withRelativeStartTime: 0.2, relativeDuration: 0.8) {
+                    self.primaryRenderView.transform = previousTransform
+                }
+            }
+        }, completion: { [weak self] _ in
+            self?.primaryRenderView.transform = .identity
+        })
+    }
+    
     deinit {
         pipController?.delegate = nil
         if pipController?.isPictureInPictureActive == true {
             pipController?.stopPictureInPicture()
         }
         pipController?.invalidate()
+        renderer.stopPiPRendering()
         renderer.stop()
         displayLayer.removeFromSuperlayer()
         NotificationCenter.default.removeObserver(self)
@@ -399,10 +464,11 @@ final class PlayerViewController: UIViewController {
         renderer.load(url: url, with: preset, headers: headers)
         if let info = mediaInfo {
             prepareSeekToLastPosition(for: info)
+            fetchIntroDBSegments(for: info)
         }
         
         if let subs = initialSubtitles, !subs.isEmpty {
-            loadSubtitles(subs)
+            pendingSubtitleURLs = subs
         }
     }
     
@@ -413,7 +479,7 @@ final class PlayerViewController: UIViewController {
         case .movie(let id, let title):
             lastPlayedTime = ProgressManager.shared.getMovieCurrentTime(movieId: id, title: title)
             
-        case .episode(let showId, let seasonNumber, let episodeNumber):
+        case .episode(let showId, _, let seasonNumber, let episodeNumber):
             lastPlayedTime = ProgressManager.shared.getEpisodeCurrentTime(showId: showId, seasonNumber: seasonNumber, episodeNumber: episodeNumber)
         }
         
@@ -422,7 +488,7 @@ final class PlayerViewController: UIViewController {
             switch mediaInfo {
             case .movie(let id, let title):
                 progress = ProgressManager.shared.getMovieProgress(movieId: id, title: title)
-            case .episode(let showId, let seasonNumber, let episodeNumber):
+            case .episode(let showId, _, let seasonNumber, let episodeNumber):
                 progress = ProgressManager.shared.getEpisodeProgress(showId: showId, seasonNumber: seasonNumber, episodeNumber: episodeNumber)
             }
             
@@ -434,8 +500,9 @@ final class PlayerViewController: UIViewController {
     
     private func setupLayout() {
         view.addSubview(videoContainer)
+        videoContainer.addSubview(primaryRenderView)
         
-        displayLayer.frame = videoContainer.bounds
+        displayLayer.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
         displayLayer.videoGravity = .resizeAspect
 #if compiler(>=6.0)
         if #available(iOS 26.0, tvOS 26.0, *) {
@@ -453,6 +520,8 @@ final class PlayerViewController: UIViewController {
         }
 #endif
         displayLayer.backgroundColor = UIColor.black.cgColor
+        displayLayer.opacity = 0.001
+        displayLayer.isHidden = false
         
         videoContainer.layer.addSublayer(displayLayer)
         videoContainer.addSubview(controlsOverlayView)
@@ -466,12 +535,18 @@ final class PlayerViewController: UIViewController {
         videoContainer.addSubview(skipForwardButton)
         videoContainer.addSubview(speedIndicatorLabel)
         videoContainer.addSubview(subtitleButton)
+        videoContainer.addSubview(skipSegmentButton)
         
         NSLayoutConstraint.activate([
             videoContainer.topAnchor.constraint(equalTo: view.topAnchor),
             videoContainer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             videoContainer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             videoContainer.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            
+            primaryRenderView.topAnchor.constraint(equalTo: videoContainer.topAnchor),
+            primaryRenderView.leadingAnchor.constraint(equalTo: videoContainer.leadingAnchor),
+            primaryRenderView.trailingAnchor.constraint(equalTo: videoContainer.trailingAnchor),
+            primaryRenderView.bottomAnchor.constraint(equalTo: videoContainer.bottomAnchor),
             
             progressContainer.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
             progressContainer.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
@@ -526,7 +601,11 @@ final class PlayerViewController: UIViewController {
             subtitleButton.trailingAnchor.constraint(equalTo: progressContainer.trailingAnchor, constant: 0),
             subtitleButton.bottomAnchor.constraint(equalTo: progressContainer.topAnchor, constant: -8),
             subtitleButton.widthAnchor.constraint(equalToConstant: 32),
-            subtitleButton.heightAnchor.constraint(equalToConstant: 32)
+            subtitleButton.heightAnchor.constraint(equalToConstant: 32),
+            
+            skipSegmentButton.trailingAnchor.constraint(equalTo: progressContainer.trailingAnchor),
+            skipSegmentButton.bottomAnchor.constraint(equalTo: progressContainer.topAnchor, constant: -14),
+            skipSegmentButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 36)
         ])
     }
     
@@ -536,6 +615,7 @@ final class PlayerViewController: UIViewController {
         pipButton.addTarget(self, action: #selector(pipTapped), for: .touchUpInside)
         skipBackwardButton.addTarget(self, action: #selector(skipBackwardTapped), for: .touchUpInside)
         skipForwardButton.addTarget(self, action: #selector(skipForwardTapped), for: .touchUpInside)
+        skipSegmentButton.addTarget(self, action: #selector(skipSegmentTapped), for: .touchUpInside)
         let tap = UITapGestureRecognizer(target: self, action: #selector(containerTapped))
         videoContainer.addGestureRecognizer(tap)
     }
@@ -619,6 +699,7 @@ final class PlayerViewController: UIViewController {
             state: subtitleModel.isVisible ? .off : .on
         ) { [weak self] _ in
             self?.subtitleModel.isVisible = false
+            self?.renderer.setSubtitleVisible(false)
             self?.updateSubtitleButtonAppearance()
             self?.updateSubtitleMenu()
         }
@@ -634,6 +715,7 @@ final class PlayerViewController: UIViewController {
                 self?.currentSubtitleIndex = index
                 self?.subtitleModel.isVisible = true
                 self?.loadCurrentSubtitle()
+                self?.renderer.setSubtitleVisible(true)
                 self?.updateSubtitleButtonAppearance()
                 self?.updateSubtitleMenu()
             }
@@ -742,9 +824,8 @@ final class PlayerViewController: UIViewController {
     }
     
     private func updateCurrentSubtitleAppearance() {
-        if subtitleModel.isVisible && currentSubtitleIndex < subtitleURLs.count {
-            loadCurrentSubtitle()
-        }
+        renderer.applySubtitleStyle(currentSubtitleStyle())
+        renderer.setSubtitleVisible(subtitleModel.isVisible)
     }
     
     private func updateSubtitleButtonAppearance() {
@@ -761,6 +842,8 @@ final class PlayerViewController: UIViewController {
             subtitleButton.isHidden = false
             currentSubtitleIndex = 0
             subtitleModel.isVisible = true
+            renderer.applySubtitleStyle(currentSubtitleStyle())
+            renderer.setSubtitleVisible(true)
             loadCurrentSubtitle()
             updateSubtitleButtonAppearance()
             updateSubtitleMenu()
@@ -770,32 +853,26 @@ final class PlayerViewController: UIViewController {
     private func loadCurrentSubtitle() {
         guard currentSubtitleIndex < subtitleURLs.count else { return }
         let urlString = subtitleURLs[currentSubtitleIndex]
-        
-        guard let url = URL(string: urlString) else {
+        guard URL(string: urlString) != nil else {
             Logger.shared.log("Invalid subtitle URL: \(urlString)", type: "Error")
             return
         }
         
-        URLSession.custom.dataTask(with: url) { [weak self] data, response, error in
-            guard let self = self else { return }
-            
-            if let error = error {
-                Logger.shared.log("Failed to download subtitles: \(error.localizedDescription)", type: "Error")
-                return
-            }
-            
-            guard let data = data, let subtitleContent = String(data: data, encoding: .utf8) else {
-                Logger.shared.log("Failed to parse subtitle data", type: "Error")
-                return
-            }
-            
-            self.parseAndDisplaySubtitles(subtitleContent)
-        }.resume()
+        renderer.applySubtitleStyle(currentSubtitleStyle())
+        renderer.clearCurrentSubtitleTrack()
+        renderer.addSubtitleTrack(urlString: urlString)
+        renderer.setSubtitleVisible(subtitleModel.isVisible)
+        Logger.shared.log("Loading subtitle track through mpv/libass: \(urlString)", type: "Info")
     }
     
-    private func parseAndDisplaySubtitles(_ content: String) {
-        subtitleEntries = SubtitleLoader.parseSubtitles(from: content, fontSize: subtitleModel.fontSize, foregroundColor: subtitleModel.foregroundColor)
-        Logger.shared.log("Loaded \(subtitleEntries.count) subtitle entries", type: "Info")
+    private func currentSubtitleStyle() -> SubtitleStyle {
+        SubtitleStyle(
+            foregroundColor: subtitleModel.foregroundColor,
+            strokeColor: subtitleModel.strokeColor,
+            strokeWidth: subtitleModel.strokeWidth,
+            fontSize: subtitleModel.fontSize,
+            isVisible: subtitleModel.isVisible
+        )
     }
     
     @objc private func subtitleButtonTapped() {
@@ -816,6 +893,7 @@ final class PlayerViewController: UIViewController {
         
         let disableAction = UIAlertAction(title: "Disable Subtitles", style: .default) { [weak self] _ in
             self?.subtitleModel.isVisible = false
+            self?.renderer.setSubtitleVisible(false)
             self?.updateSubtitleButtonAppearance()
         }
         alert.addAction(disableAction)
@@ -825,6 +903,7 @@ final class PlayerViewController: UIViewController {
                 self?.currentSubtitleIndex = index
                 self?.subtitleModel.isVisible = true
                 self?.loadCurrentSubtitle()
+                self?.renderer.setSubtitleVisible(true)
                 self?.updateSubtitleButtonAppearance()
             }
             alert.addAction(action)
@@ -856,7 +935,7 @@ final class PlayerViewController: UIViewController {
             @ObservedObject var model: ProgressModel
             var onEditingChanged: (Bool) -> Void
             var body: some View {
-                MusicProgressSlider(value: Binding(get: { model.position }, set: { model.position = $0 }), inRange: 0...max(model.duration, 1.0), activeFillColor: .white, fillColor: .white, textColor: .white.opacity(0.7), emptyColor: .white.opacity(0.3), height: 33, onEditingChanged: onEditingChanged)
+                MusicProgressSlider(value: Binding(get: { model.position }, set: { model.position = $0 }), inRange: 0...max(model.duration, 1.0), activeFillColor: .white, fillColor: .white, textColor: .white.opacity(0.7), emptyColor: .white.opacity(0.3), height: 33, highlights: model.highlights, onEditingChanged: onEditingChanged)
             }
         }
         
@@ -1016,6 +1095,13 @@ final class PlayerViewController: UIViewController {
         }
     }
     
+    @objc private func skipSegmentTapped() {
+        guard let segment = currentActiveSegment(at: cachedPosition) else { return }
+        guard let target = resolvedEnd(for: segment, duration: cachedDuration) else { return }
+        renderer.seek(to: max(0, target))
+        showControlsTemporarily()
+    }
+    
     private func showControlsTemporarily() {
         controlsHideWorkItem?.cancel()
         controlsVisible = true
@@ -1080,6 +1166,8 @@ final class PlayerViewController: UIViewController {
         if pip.isPictureInPictureActive {
             pip.stopPictureInPicture()
         } else if pip.isPictureInPicturePossible {
+            renderer.startPiPRendering()
+            pip.updatePlaybackState()
             pip.startPictureInPicture()
         }
     }
@@ -1090,9 +1178,11 @@ final class PlayerViewController: UIViewController {
             self.cachedPosition = position
             if duration > 0 {
                 self.updateProgressHostingController()
+                self.updateProgressHighlights(duration: duration)
             }
             self.progressModel.position = position
             self.progressModel.duration = max(duration, 1.0)
+            self.updateActiveSkipSegment(at: position, duration: duration)
             
             if self.pipController?.isPictureInPictureActive == true {
                 self.pipController?.updatePlaybackState()
@@ -1104,8 +1194,8 @@ final class PlayerViewController: UIViewController {
         switch info {
         case .movie(let id, let title):
             ProgressManager.shared.updateMovieProgress(movieId: id, title: title, currentTime: position, totalDuration: duration)
-        case .episode(let showId, let seasonNumber, let episodeNumber):
-            ProgressManager.shared.updateEpisodeProgress(showId: showId, seasonNumber: seasonNumber, episodeNumber: episodeNumber, currentTime: position, totalDuration: duration)
+        case .episode(let showId, let showTitle, let seasonNumber, let episodeNumber):
+            ProgressManager.shared.updateEpisodeProgress(showId: showId, showTitle: showTitle, seasonNumber: seasonNumber, episodeNumber: episodeNumber, currentTime: position, totalDuration: duration)
         }
     }
     
@@ -1120,6 +1210,73 @@ final class PlayerViewController: UIViewController {
         } else {
             return String(format: "%02d:%02d", m, s)
         }
+    }
+    
+    private func fetchIntroDBSegments(for mediaInfo: MediaInfo) {
+        IntroDBService.shared.fetchSegments(for: mediaInfo) { [weak self] result in
+            guard let self = self else { return }
+            
+            switch result {
+            case .success(let segments):
+                DispatchQueue.main.async {
+                    self.introDBSegments = segments
+                    self.updateProgressHighlights(duration: self.cachedDuration)
+                    self.updateActiveSkipSegment(at: self.cachedPosition, duration: self.cachedDuration)
+                }
+                Logger.shared.log("Loaded \(segments.count) IntroDB segments", type: "Info")
+            case .failure(let error):
+                Logger.shared.log("IntroDB request failed: \(error.localizedDescription)", type: "Warn")
+            }
+        }
+    }
+    
+    private func updateProgressHighlights(duration: Double) {
+        let highlights = IntroDBService.shared.highlights(for: introDBSegments, duration: duration)
+        progressModel.highlights = highlights.map {
+            ProgressHighlight(start: $0.start, end: $0.end, color: Color($0.color), label: $0.label)
+        }
+    }
+    
+    private func currentActiveSegment(at position: Double, duration: Double? = nil) -> IntroDBSegment? {
+        return IntroDBService.shared.activeSegment(at: position, in: introDBSegments, duration: duration ?? cachedDuration)
+    }
+    
+    private func updateActiveSkipSegment(at position: Double, duration: Double) {
+        let active = currentActiveSegment(at: position, duration: duration)
+        let newID = active?.id
+        guard newID != activeSkipSegmentID else { return }
+        activeSkipSegmentID = newID
+        
+        if let active {
+            showSkipButton(for: active)
+        } else {
+            hideSkipButton()
+        }
+    }
+    
+    private func showSkipButton(for segment: IntroDBSegment) {
+        let title = "Skip \(segment.db.title)"
+        skipSegmentButton.setTitle(title, for: .normal)
+        skipSegmentButton.backgroundColor = segment.db.uiColor.withAlphaComponent(0.55)
+        
+        guard skipSegmentButton.isHidden || skipSegmentButton.alpha < 1.0 else { return }
+        skipSegmentButton.isHidden = false
+        UIView.animate(withDuration: 0.2) {
+            self.skipSegmentButton.alpha = 1.0
+        }
+    }
+    
+    private func hideSkipButton() {
+        guard !skipSegmentButton.isHidden else { return }
+        UIView.animate(withDuration: 0.2, animations: {
+            self.skipSegmentButton.alpha = 0.0
+        }, completion: { _ in
+            self.skipSegmentButton.isHidden = true
+        })
+    }
+    
+    private func resolvedEnd(for segment: IntroDBSegment, duration: Double) -> Double? {
+        return segment.resolvedEnd(duration: duration)
     }
 }
 
@@ -1157,43 +1314,31 @@ extension PlayerViewController: MPVSoftwareRendererDelegate {
                 Logger.shared.log("Resumed MPV playback from \(Int(seekTime))s", type: "Progress")
                 self.pendingSeekTime = nil
             }
+            if let subs = self.pendingSubtitleURLs {
+                self.pendingSubtitleURLs = nil
+                self.loadSubtitles(subs)
+            }
         }
     }
     
-    func renderer(_ renderer: MPVSoftwareRenderer, getSubtitleForTime time: Double) -> NSAttributedString? {
-        guard subtitleModel.isVisible, !subtitleEntries.isEmpty else {
-            return nil
-        }
-        
-        if let entry = subtitleEntries.first(where: { $0.startTime <= time && time <= $0.endTime }) {
-            return entry.attributedText
-        }
-        
-        return nil
-    }
-    
-    func renderer(_ renderer: MPVSoftwareRenderer, getSubtitleStyle: Void) -> SubtitleStyle {
-        let style = SubtitleStyle(
-            foregroundColor: subtitleModel.foregroundColor,
-            strokeColor: subtitleModel.strokeColor,
-            strokeWidth: subtitleModel.strokeWidth,
-            fontSize: subtitleModel.fontSize,
-            isVisible: subtitleModel.isVisible
-        )
-        return style
-    }
 }
 
 // MARK: - PiP Support
 extension PlayerViewController: PiPControllerDelegate {
     func pipController(_ controller: PiPController, willStartPictureInPicture: Bool) {
+        renderer.startPiPRendering()
         pipController?.updatePlaybackState()
     }
     func pipController(_ controller: PiPController, didStartPictureInPicture: Bool) {
+        if !didStartPictureInPicture {
+            renderer.stopPiPRendering()
+        }
         pipController?.updatePlaybackState()
     }
     func pipController(_ controller: PiPController, willStopPictureInPicture: Bool) { }
-    func pipController(_ controller: PiPController, didStopPictureInPicture: Bool) { }
+    func pipController(_ controller: PiPController, didStopPictureInPicture: Bool) {
+        renderer.stopPiPRendering()
+    }
     func pipController(_ controller: PiPController, restoreUserInterfaceForPictureInPictureStop completionHandler: @escaping (Bool) -> Void) {
         if presentedViewController != nil {
             dismiss(animated: true) { completionHandler(true) }
@@ -1217,6 +1362,8 @@ extension PlayerViewController: PiPControllerDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self, let pip = self.pipController else { return }
             if pip.isPictureInPicturePossible && !pip.isPictureInPictureActive {
+                self.renderer.startPiPRendering()
+                pip.updatePlaybackState()
                 pip.startPictureInPicture()
             }
         }

@@ -11,6 +11,14 @@ struct SettingsView: View {
     @AppStorage("tmdbLanguage") private var selectedLanguage = "en-US"
     @StateObject private var algorithmManager = AlgorithmManager.shared
     @AppStorage("showKanzen") private var showKanzen: Bool = false
+
+    private var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+    }
+
+    private var buildNumber: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+    }
     
     let languages = [
         ("en-US", "English (US)"),
@@ -39,51 +47,50 @@ struct SettingsView: View {
     ]
     
     var body: some View {
-        #if os(tvOS)
-            HStack(spacing: 0) {
-                VStack(spacing: 30) {
-                    Image("Luna")
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 500, height: 500)
-                        .clipShape(RoundedRectangle(cornerRadius: 100, style: .continuous))
-                        .shadow(radius: 10)
-
-                    VStack(spacing: 15) {
-                        Text("Version \(Bundle.main.appVersion) (\(Bundle.main.buildNumber))")
-                            .font(.footnote)
-                            .fontWeight(.regular)
-                            .foregroundColor(.secondary)
-
-                        Text("Copyright © \(String(Calendar.current.component(.year, from: Date()))) Luna by Cranci")
-                            .font(.footnote)
-                            .fontWeight(.semibold)
-                            .foregroundColor(.white)
-                    }
+#if os(tvOS)
+        HStack(spacing: 0) {
+            VStack(spacing: 30) {
+                Image("Luna")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 500, height: 500)
+                    .clipShape(RoundedRectangle(cornerRadius: 100, style: .continuous))
+                    .shadow(radius: 10)
+                
+                VStack(spacing: 15) {
+                    Text("Version \(appVersion) (\(buildNumber))")
+                        .font(.footnote)
+                        .fontWeight(.regular)
+                        .foregroundColor(.secondary)
+                    
+                    Text("Copyright © \(String(Calendar.current.component(.year, from: Date()))) Luna by cranci")
+                        .font(.footnote)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.white)
                 }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                NavigationStack {
-                    settingsContent
-                        // prevent row clipping
-                        .padding(.horizontal, 20)
-                }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-        #else
-            if #available(iOS 16.0, *) {
-                NavigationStack {
-                    settingsContent
-                }
-            } else {
-                NavigationView {
-                    settingsContent
-                }
-                .navigationViewStyle(StackNavigationViewStyle())
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            
+            NavigationStack {
+                settingsContent
+                    .padding(.horizontal, 20)
             }
-        #endif
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+#else
+        if #available(iOS 16.0, *) {
+            NavigationStack {
+                settingsContent
+            }
+        } else {
+            NavigationView {
+                settingsContent
+            }
+            .navigationViewStyle(StackNavigationViewStyle())
+        }
+#endif
     }
-
+    
     private var settingsContent: some View {
         List {
             Section {
@@ -99,7 +106,7 @@ struct SettingsView: View {
                             .foregroundColor(.secondary)
                     }
                 }
-
+                
                 NavigationLink(destination: TMDBFiltersView()) {
                     Text("Content Filters")
                 }
@@ -137,11 +144,15 @@ struct SettingsView: View {
                     Text("Appearance")
                 }
                 
+                NavigationLink(destination: TrackingSettingsView()) {
+                    Text("Trackers")
+                }
+                
                 NavigationLink(destination: ServicesView()) {
                     Text("Services")
                 }
             }
-
+            
             Section {
                 NavigationLink(destination: StorageView()) {
                     Text("Storage")
@@ -154,22 +165,23 @@ struct SettingsView: View {
                 Text("MICS")
             }
             
-            Section{
+            Section {
                 Text("Switch to Kanzen")
                     .onTapGesture {
                         showKanzen = true
                     }
-            }
-            header:{
+            } header: {
                 Text("Others")
             }
+            
+            Section(footer: Text("Luna 1.0.0 - cranci1")) {}
         }
-        #if !os(tvOS)
-            .navigationTitle("Settings")
-        #else
-            .listStyle(.grouped)
-            .scrollClipDisabled()
-        #endif
+#if !os(tvOS)
+        .navigationTitle("Settings")
+#else
+        .listStyle(.grouped)
+        .scrollClipDisabled()
+#endif
     }
 }
 
